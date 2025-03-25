@@ -1,0 +1,35 @@
+{
+  "name": "ai-recruitment-frontend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "vue-tsc --skipLibCheck --noEmit",
+    "preview": "vite preview",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "ai",
+    "recruitment",
+    "vue3",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "description": "AI招聘推荐平台前端",
+  "dependencies": {
+    "axios": "^1.6.7",
+    "element-plus": "^2.5.6",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.21",
+    "vue-router": "^4.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.13",
+    "@vitejs/plugin-vue": "^5.2.3",
+    "typescript": "^5.8.2",
+    "vite": "^5.1.5",
+    "vue-tsc": "^2.2.8"
+  }
+}
