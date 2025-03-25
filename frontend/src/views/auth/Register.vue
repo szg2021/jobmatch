@@ -227,13 +227,13 @@ const handleRegister = async () => {
         ElMessage.error(userStore.error || '注册失败，请稍后再试');
       }
     } catch (error) {
-      console.error('注册失败', error);
       // 错误已由全局处理器处理
     } finally {
       loading.value = false;
     }
   } catch (validationError) {
-    console.log('表单验证失败', validationError);
+    // 表单验证失败，不执行注册操作
+    loading.value = false;
   }
 };
 

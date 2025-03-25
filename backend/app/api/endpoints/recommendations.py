@@ -1,8 +1,9 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Path, Body
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from app.db.session import get_db
 from app.models.user import User, UserRole
@@ -11,6 +12,16 @@ from app.services.document_service import get_job, get_resume, get_document
 from app.services.recommendation_service import get_recommended_resumes, get_recommended_jobs, weaviate_client
 from app.services.user_service import get_current_user, check_if_company
 from app.core.rate_limit import limiter
+from app.api.deps import get_current_user, get_db
+from app.crud.crud_resume import resume as crud_resume
+from app.crud.crud_job import job as crud_job
+from app.schemas.recommendation import (
+    JobRecommendationResponse,
+    ResumeRecommendationResponse
+)
+from app.schemas.response import StandardResponse
+from app.services.feedback_service import feedback_service, FeedbackType
+from app.models.feedback import RecommendationFeedback
 
 # 获取日志记录器
 logger = logging.getLogger("app.api.recommendations")
@@ -18,74 +29,124 @@ logger = logging.getLogger("app.api.recommendations")
 router = APIRouter()
 
 
-@router.get("/jobs-for-resume/{resume_id}", response_model=List[Dict[str, Any]])
-@limiter.limit("10/minute")
-async def get_jobs_for_resume(
+class RecommendationResponse(BaseModel):
+    id: int
+    title: str
+    match_score: float
+    algorithms: List[str] = []
+    match_details: Optional[dict] = None
+
+
+class JobRecommendation(RecommendationResponse):
+    company: Optional[str] = None
+
+
+class ResumeRecommendation(RecommendationResponse):
+    user: dict
+
+
+class FeedbackRequest(BaseModel):
+    feedback_type: str
+    job_id: Optional[int] = None
+    resume_id: Optional[int] = None
+    rating: Optional[float] = None
+    comment: Optional[str] = None
+    algorithm: Optional[str] = None
+
+
+@router.get("/jobs", response_model=StandardResponse[List[JobRecommendationResponse]])
+async def get_job_recommendations(
     resume_id: int,
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = 20,
+    include_details: bool = True,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
-) -> Any:
+):
     """
-    获取与特定简历匹配的岗位推荐
+    获取基于简历的职位推荐
     """
-    # 验证简历是否存在
-    resume = await get_resume(db=db, resume_id=resume_id)
-    if not resume:
-        raise HTTPException(status_code=404, detail="简历不存在")
-    
-    # 验证权限
-    if current_user.role != UserRole.ADMIN and resume.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="无权访问此简历的推荐"
+    try:
+        # 验证简历所有者
+        resume = crud_resume.get(db, id=resume_id)
+        if not resume:
+            return StandardResponse(
+                success=False,
+                message="简历不存在",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        if resume.user_id != current_user.id:
+            return StandardResponse(
+                success=False,
+                message="您无权访问此简历",
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        # 获取推荐结果
+        recommendations = await get_recommended_jobs(db, resume_id, limit, include_details)
+        
+        # 返回结果
+        return StandardResponse(
+            success=True,
+            message=f"成功获取{len(recommendations)}个职位推荐",
+            data=recommendations
         )
     
-    # 验证用户角色
-    if current_user.role != UserRole.JOBSEEKER and current_user.role != UserRole.ADMIN:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有求职者可以获取岗位推荐"
+    except Exception as e:
+        logger.error(f"获取职位推荐时出错: {str(e)}", exc_info=True)
+        return StandardResponse(
+            success=False,
+            message=f"获取推荐失败: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
-    
-    # 获取推荐岗位
-    recommended_jobs = await get_recommended_jobs(db=db, resume_id=resume_id, limit=limit)
-    return recommended_jobs
 
 
-@router.get("/resumes-for-job/{job_id}", response_model=List[Dict[str, Any]])
-@limiter.limit("10/minute")
-async def get_resumes_for_job(
+@router.get("/resumes", response_model=StandardResponse[List[ResumeRecommendationResponse]])
+async def get_resume_recommendations(
     job_id: int,
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = 20,
+    include_details: bool = True,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
-) -> Any:
+):
     """
-    获取与特定岗位匹配的简历推荐
+    获取基于职位的简历推荐
     """
-    # 验证岗位是否存在
-    job = await get_job(db=db, job_id=job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="岗位不存在")
-    
-    # 验证权限
-    if current_user.role != UserRole.ADMIN and job.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="无权访问此岗位的推荐"
+    try:
+        # 验证职位是否存在
+        job = crud_job.get(db, id=job_id)
+        if not job:
+            return StandardResponse(
+                success=False,
+                message="职位不存在",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # 公司用户只能查看自己公司的职位推荐
+        if current_user.role == "company" and job.company_id != current_user.company_id:
+            return StandardResponse(
+                success=False,
+                message="您无权访问此职位的推荐",
+                status_code=status.HTTP_403_FORBIDDEN
+            )
+        
+        # 获取推荐结果
+        recommendations = await get_recommended_resumes(db, job_id, limit, include_details)
+        
+        # 返回结果
+        return StandardResponse(
+            success=True,
+            message=f"成功获取{len(recommendations)}个简历推荐",
+            data=recommendations
         )
     
-    # 验证用户角色
-    if current_user.role != UserRole.COMPANY and current_user.role != UserRole.ADMIN:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有企业用户可以获取人才推荐"
+    except Exception as e:
+        logger.error(f"获取简历推荐时出错: {str(e)}", exc_info=True)
+        return StandardResponse(
+            success=False,
+            message=f"获取推荐失败: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
-    
-    # 获取推荐简历
-    recommended_resumes = await get_recommended_resumes(db=db, job_id=job_id, limit=limit)
-    return recommended_resumes
 
 
 @router.get("/top-matches-for-jobseeker", response_model=List[Dict[str, Any]])
@@ -291,4 +352,240 @@ async def get_recommendation_stats(
             "potential_candidates": active_jobs * stats["total"]["resumes"] if active_jobs > 0 else 0
         }
     
-    return stats 
+    return stats
+
+
+@router.get("/system-status", response_model=StandardResponse)
+async def get_recommendation_system_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    获取推荐系统状态信息
+    """
+    from app.core.tasks import vector_search_initialized, last_trained_time, training_in_progress
+    
+    try:
+        # 获取系统状态
+        status_info = {
+            "vector_search_initialized": vector_search_initialized,
+            "last_model_training": last_trained_time.isoformat() if last_trained_time else None,
+            "training_in_progress": training_in_progress
+        }
+        
+        # 获取数据统计
+        from sqlalchemy import func
+        job_count = db.query(func.count()).select_from(crud_job.model).scalar()
+        resume_count = db.query(func.count()).select_from(crud_resume.model).scalar()
+        
+        status_info["stats"] = {
+            "total_jobs": job_count,
+            "total_resumes": resume_count
+        }
+        
+        # 返回结果
+        return StandardResponse(
+            success=True,
+            message="推荐系统状态获取成功",
+            data=status_info
+        )
+    
+    except Exception as e:
+        logger.error(f"获取推荐系统状态时出错: {str(e)}", exc_info=True)
+        return StandardResponse(
+            success=False,
+            message=f"获取推荐系统状态失败: {str(e)}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@router.get("/jobs/{resume_id}", response_model=List[JobRecommendation])
+async def get_recommended_jobs_for_resume(
+    resume_id: int = Path(..., description="简历ID"),
+    limit: int = Query(10, description="返回结果数量限制"),
+    details: bool = Query(True, description="是否包含匹配详情"),
+    use_cache: bool = Query(True, description="是否使用缓存"),
+    apply_feedback: bool = Query(True, description="是否应用用户反馈进行个性化"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    获取针对指定简历的推荐职位列表
+    """
+    # 检查简历是否属于当前用户
+    # 注意：在实际生产环境中应添加适当的权限检查
+    
+    # 获取推荐职位
+    recommendations = await get_recommended_jobs(
+        db=db, 
+        resume_id=resume_id, 
+        limit=limit, 
+        include_details=details,
+        use_cache=use_cache
+    )
+    
+    # 如果启用了反馈调整且有当前用户
+    if apply_feedback and current_user:
+        recommendations = await feedback_service.apply_feedback_to_recommendations(
+            user_id=current_user.id,
+            recommendations=recommendations,
+            is_job_recommendations=True
+        )
+    
+    # 记录查看反馈
+    if current_user:
+        try:
+            # 对于每个推荐都记录"已查看"反馈
+            for rec in recommendations:
+                await feedback_service.record_feedback(
+                    db=db,
+                    user_id=current_user.id,
+                    feedback_type=FeedbackType.VIEWED.value,
+                    job_id=rec.get("id"),
+                    resume_id=resume_id,
+                    algorithm=",".join(rec.get("algorithms", ["unknown"]))
+                )
+        except Exception as e:
+            # 记录错误但不中断响应
+            print(f"记录查看反馈时出错: {str(e)}")
+    
+    return recommendations
+
+
+@router.get("/resumes/{job_id}", response_model=List[ResumeRecommendation])
+async def get_recommended_resumes_for_job(
+    job_id: int = Path(..., description="职位ID"),
+    limit: int = Query(10, description="返回结果数量限制"),
+    details: bool = Query(True, description="是否包含匹配详情"),
+    use_cache: bool = Query(True, description="是否使用缓存"),
+    apply_feedback: bool = Query(True, description="是否应用用户反馈进行个性化"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    获取针对指定职位的推荐简历列表
+    """
+    # 检查职位是否属于当前用户
+    # 注意：在实际生产环境中应添加适当的权限检查
+    
+    # 获取推荐简历
+    recommendations = await get_recommended_resumes(
+        db=db, 
+        job_id=job_id, 
+        limit=limit, 
+        include_details=details,
+        use_cache=use_cache
+    )
+    
+    # 如果启用了反馈调整且有当前用户
+    if apply_feedback and current_user:
+        recommendations = await feedback_service.apply_feedback_to_recommendations(
+            user_id=current_user.id,
+            recommendations=recommendations,
+            is_job_recommendations=False
+        )
+    
+    # 记录查看反馈
+    if current_user:
+        try:
+            # 对于每个推荐都记录"已查看"反馈
+            for rec in recommendations:
+                await feedback_service.record_feedback(
+                    db=db,
+                    user_id=current_user.id,
+                    feedback_type=FeedbackType.VIEWED.value,
+                    job_id=job_id,
+                    resume_id=rec.get("id"),
+                    algorithm=",".join(rec.get("algorithms", ["unknown"]))
+                )
+        except Exception as e:
+            # 记录错误但不中断响应
+            print(f"记录查看反馈时出错: {str(e)}")
+    
+    return recommendations
+
+
+@router.post("/feedback", response_model=dict)
+async def submit_recommendation_feedback(
+    feedback: FeedbackRequest = Body(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    提交推荐结果反馈
+    """
+    if not feedback.job_id and not feedback.resume_id:
+        raise HTTPException(status_code=400, detail="必须提供职位ID或简历ID")
+    
+    try:
+        # 记录反馈
+        record = await feedback_service.record_feedback(
+            db=db,
+            user_id=current_user.id,
+            feedback_type=feedback.feedback_type,
+            job_id=feedback.job_id,
+            resume_id=feedback.resume_id,
+            rating=feedback.rating,
+            comment=feedback.comment,
+            algorithm=feedback.algorithm
+        )
+        
+        return {
+            "status": "success",
+            "message": "反馈已记录",
+            "feedback_id": record.id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"记录反馈时出错: {str(e)}")
+
+
+@router.get("/feedback/user/{user_id}", response_model=List[dict])
+async def get_user_feedback(
+    user_id: int = Path(..., description="用户ID"),
+    feedback_type: Optional[str] = Query(None, description="反馈类型"),
+    days: Optional[int] = Query(30, description="查询天数"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    获取用户反馈历史
+    """
+    # 权限检查：只允许用户查看自己的反馈或管理员查看任何人的反馈
+    if current_user.id != user_id and not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="没有权限查看此用户的反馈")
+    
+    feedbacks = await feedback_service.get_feedback_for_user(
+        db=db,
+        user_id=user_id,
+        feedback_type=feedback_type,
+        days=days
+    )
+    
+    # 转换为可序列化格式
+    result = []
+    for f in feedbacks:
+        result.append({
+            "id": f.id,
+            "user_id": f.user_id,
+            "job_id": f.job_id,
+            "resume_id": f.resume_id,
+            "feedback_type": f.feedback_type,
+            "rating": f.rating,
+            "comment": f.comment,
+            "algorithm": f.algorithm,
+            "created_at": f.created_at.isoformat() if f.created_at else None
+        })
+    
+    return result
+
+
+@router.get("/metrics", response_model=dict)
+async def get_recommendation_metrics(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_superuser)
+):
+    """
+    获取推荐系统性能指标（仅管理员可用）
+    """
+    metrics = await feedback_service.compute_feedback_metrics(db)
+    return metrics 

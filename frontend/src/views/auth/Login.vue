@@ -194,7 +194,8 @@ const handleLogin = async () => {
       loading.value = false;
     }
   } catch (validationError) {
-    console.log('表单验证失败', validationError);
+    // 表单验证失败，不执行登录操作
+    loading.value = false;
   }
 };
 

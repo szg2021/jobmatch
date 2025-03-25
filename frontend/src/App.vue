@@ -5,11 +5,13 @@
         <component :is="Component" />
       </transition>
     </router-view>
+    <LogViewer />
   </div>
 </template>
 
 <script lang="ts" setup>
 // App根组件
+import LogViewer from '@/components/common/LogViewer.vue';
 </script>
 
 <style>

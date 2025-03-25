@@ -1,11 +1,24 @@
 from typing import List, Dict, Any, Optional
 import os
 import logging
+import time
 from sqlalchemy.orm import Session
+from datetime import datetime, timedelta
 
 from app.core.config import settings
 from app.models.document import Resume, Job
 from app.models.user import User
+from app.services.lightfm_recommendation_service import (
+    get_lightfm_job_recommendations,
+    get_lightfm_resume_recommendations,
+    is_lightfm_ready
+)
+from app.services.vector_search_service import (
+    vector_search_service,
+    get_vector_job_recommendations,
+    get_vector_resume_recommendations
+)
+from app.crud.crud_recommendation_config import recommendation_config
 
 # 获取日志记录器
 logger = logging.getLogger("app.services.recommendation")
@@ -13,549 +26,448 @@ logger = logging.getLogger("app.services.recommendation")
 # 检查是否处于开发环境
 DEV_MODE = os.environ.get("APP_ENV", "development") == "development" or settings.USE_SQLITE
 
-# 尝试导入Weaviate客户端，如果在开发环境则使用模拟实现
-weaviate_client = None
+# 推荐结果缓存
+recommendation_cache = {
+    "jobs": {},     # 职位推荐缓存: {resume_id: {"results": [...], "timestamp": datetime, "config_id": id}}
+    "resumes": {}   # 简历推荐缓存: {job_id: {"results": [...], "timestamp": datetime, "config_id": id}}
+}
 
-if not DEV_MODE:
+# 缓存配置
+CACHE_TTL = 3600  # 缓存有效期(秒)
+DEFAULT_CACHE_ENABLED = True  # 默认是否启用缓存
+
+# 清理过期缓存
+def clean_expired_cache():
+    """清理过期的缓存项"""
+    now = datetime.now()
+    expired_count = 0
+    
+    # 清理职位推荐缓存
+    expired_resume_ids = []
+    for resume_id, cache_item in recommendation_cache["jobs"].items():
+        if (now - cache_item["timestamp"]).total_seconds() > CACHE_TTL:
+            expired_resume_ids.append(resume_id)
+            expired_count += 1
+    
+    for resume_id in expired_resume_ids:
+        del recommendation_cache["jobs"][resume_id]
+    
+    # 清理简历推荐缓存
+    expired_job_ids = []
+    for job_id, cache_item in recommendation_cache["resumes"].items():
+        if (now - cache_item["timestamp"]).total_seconds() > CACHE_TTL:
+            expired_job_ids.append(job_id)
+            expired_count += 1
+    
+    for job_id in expired_job_ids:
+        del recommendation_cache["resumes"][job_id]
+    
+    if expired_count > 0:
+        logger.info(f"已清理 {expired_count} 条过期缓存")
+
+# 定期清理缓存的函数，可以由任务调度器调用
+async def schedule_cache_cleanup():
+    """定期清理缓存的任务"""
+    clean_expired_cache()
+
+# 缓存职位推荐结果
+def cache_job_recommendations(resume_id: int, results: List[Dict[str, Any]], config_id: int):
+    """缓存职位推荐结果"""
+    recommendation_cache["jobs"][resume_id] = {
+        "results": results,
+        "timestamp": datetime.now(),
+        "config_id": config_id
+    }
+    logger.debug(f"已缓存简历 {resume_id} 的职位推荐结果")
+
+# 缓存简历推荐结果
+def cache_resume_recommendations(job_id: int, results: List[Dict[str, Any]], config_id: int):
+    """缓存简历推荐结果"""
+    recommendation_cache["resumes"][job_id] = {
+        "results": results,
+        "timestamp": datetime.now(),
+        "config_id": config_id
+    }
+    logger.debug(f"已缓存职位 {job_id} 的简历推荐结果")
+
+# 获取职位推荐缓存
+def get_cached_job_recommendations(resume_id: int, config_id: int) -> Optional[List[Dict[str, Any]]]:
+    """获取缓存的职位推荐结果"""
+    if resume_id in recommendation_cache["jobs"]:
+        cache_item = recommendation_cache["jobs"][resume_id]
+        
+        # 检查是否过期
+        if (datetime.now() - cache_item["timestamp"]).total_seconds() <= CACHE_TTL:
+            # 检查配置是否变更
+            if cache_item["config_id"] == config_id:
+                logger.debug(f"使用缓存的简历 {resume_id} 职位推荐结果")
+                return cache_item["results"]
+    
+    return None
+
+# 获取简历推荐缓存
+def get_cached_resume_recommendations(job_id: int, config_id: int) -> Optional[List[Dict[str, Any]]]:
+    """获取缓存的简历推荐结果"""
+    if job_id in recommendation_cache["resumes"]:
+        cache_item = recommendation_cache["resumes"][job_id]
+        
+        # 检查是否过期
+        if (datetime.now() - cache_item["timestamp"]).total_seconds() <= CACHE_TTL:
+            # 检查配置是否变更
+            if cache_item["config_id"] == config_id:
+                logger.debug(f"使用缓存的职位 {job_id} 简历推荐结果")
+                return cache_item["results"]
+    
+    return None
+
+# 使用缓存修改推荐函数
+async def get_recommended_jobs(
+    db: Session,
+    resume_id: int,
+    limit: int = None,
+    include_details: bool = True,
+    use_cache: bool = DEFAULT_CACHE_ENABLED
+) -> List[Dict[str, Any]]:
+    """
+    获取推荐职位列表
+    
+    Args:
+        db: 数据库会话
+        resume_id: 简历ID
+        limit: 返回结果数量限制
+        include_details: 是否包含详细信息
+        use_cache: 是否使用缓存
+        
+    Returns:
+        推荐职位列表
+    """
     try:
-        import weaviate
-        # 连接到Weaviate
-        auth_config = None
-        if settings.WEAVIATE_API_KEY:
-            auth_config = weaviate.AuthApiKey(api_key=settings.WEAVIATE_API_KEY)
+        start_time = time.time()
+        
+        # 获取当前配置或使用默认值
+        config = recommendation_config.get_active_config(db)
+        if not config:
+            logger.warning("找不到活跃的推荐配置，将创建默认配置")
+            config = recommendation_config.create_default_config(db)
+        
+        # 如果仍没有配置，使用默认值
+        if not config:
+            logger.warning("无法创建默认配置，使用硬编码的默认值")
+            max_recommendations = 10
+            vector_weight = 0.6
+            lightfm_weight = 0.4
+            config_id = 0
+        else:
+            max_recommendations = config.max_recommendations
+            vector_weight = config.vector_weight
+            lightfm_weight = config.lightfm_weight
+            config_id = config.id
             
-        weaviate_client = weaviate.Client(
-            url=settings.WEAVIATE_URL,
-            auth_client_secret=auth_config
-        )
-        logger.info(f"Weaviate 连接成功: {settings.WEAVIATE_URL}")
-    except Exception as e:
-        logger.error(f"Weaviate 连接失败: {str(e)}")
-        weaviate_client = None
-else:
-    logger.info("开发模式：使用模拟的Weaviate客户端")
-
-
-class WeaviateClient:
-    """Weaviate向量数据库客户端"""
-    
-    def __init__(self):
-        """初始化Weaviate客户端"""
-        self.client = None
+            # 确保权重总和为1
+            if abs(vector_weight + lightfm_weight - 1.0) > 0.001:
+                logger.warning(f"向量权重({vector_weight})和LightFM权重({lightfm_weight})之和不为1，将进行归一化")
+                total = vector_weight + lightfm_weight
+                if total > 0:
+                    vector_weight = vector_weight / total
+                    lightfm_weight = lightfm_weight / total
+                else:
+                    # 如果总和为0或负数，设置默认值
+                    vector_weight = 0.6
+                    lightfm_weight = 0.4
+                    logger.warning(f"权重总和异常，已重置为默认值：向量权重={vector_weight}，LightFM权重={lightfm_weight}")
+        
+        # 应用结果数量限制
+        if limit is None:
+            limit = max_recommendations
+        elif limit <= 0:
+            logger.warning(f"无效的结果数量限制: {limit}，将使用默认值: {max_recommendations}")
+            limit = max_recommendations
+        
+        # 检查缓存
+        if use_cache:
+            cached_results = get_cached_job_recommendations(resume_id, config_id)
+            if cached_results:
+                # 如果缓存有效，直接返回（考虑limit限制）
+                result = cached_results[:limit] if limit < len(cached_results) else cached_results
+                logger.info(f"使用缓存返回简历 {resume_id} 的推荐职位，耗时: {time.time() - start_time:.3f}秒")
+                return result
+        
+        # 使用向量搜索获取推荐
+        vector_recommendations = []
         try:
-            auth_config = weaviate.auth.AuthApiKey(api_key=settings.WEAVIATE_API_KEY) if settings.WEAVIATE_API_KEY else None
-            self.client = weaviate.Client(
-                url=settings.WEAVIATE_URL,
-                auth_client_secret=auth_config
-            )
-            
-            # 检查连接
-            if not self.client.is_ready():
-                raise Exception("Weaviate服务不可用")
-                
-            # 确保模式存在
-            self._ensure_schema_exists()
-            
+            vector_recommendations = await get_vector_job_recommendations(db, resume_id, limit=int(limit * 1.5))
+            logger.info(f"向量搜索为简历 {resume_id} 找到 {len(vector_recommendations)} 个推荐职位")
         except Exception as e:
-            logger.error(f"初始化Weaviate客户端失败: {str(e)}")
-            self.client = None
-    
-    def is_ready(self):
-        """检查客户端是否准备就绪"""
-        return self.client is not None
-    
-    def check_connection(self):
-        """检查连接状态并尝试重新连接"""
-        if self.client is None:
+            logger.error(f"向量搜索推荐职位时出错: {str(e)}", exc_info=True)
+        
+        # 检查LightFM模型是否就绪
+        lightfm_recommendations = []
+        if is_lightfm_ready():
             try:
-                auth_config = weaviate.auth.AuthApiKey(api_key=settings.WEAVIATE_API_KEY) if settings.WEAVIATE_API_KEY else None
-                self.client = weaviate.Client(
-                    url=settings.WEAVIATE_URL,
-                    auth_client_secret=auth_config
-                )
-                
-                if not self.client.is_ready():
-                    raise Exception("Weaviate服务不可用")
-                    
-                # 确保模式存在
-                self._ensure_schema_exists()
-                return True
+                # 使用LightFM获取推荐
+                lightfm_recommendations = await get_lightfm_job_recommendations(resume_id, db, limit=int(limit * 1.5))
+                logger.info(f"LightFM为简历 {resume_id} 找到 {len(lightfm_recommendations)} 个推荐职位")
             except Exception as e:
-                logger.error(f"重新连接Weaviate失败: {str(e)}")
-                self.client = None
-                return False
-        return self.client.is_ready()
-    
-    def _ensure_schema_exists(self):
-        """确保所需的模式存在"""
-        if not self.client:
-            raise Exception("Weaviate客户端未初始化")
-            
-        # 检查并创建Resume类
-        if not self.client.schema.exists("Resume"):
-            resume_class = {
-                "class": "Resume",
-                "description": "求职者简历",
-                "vectorizer": "text2vec-openai",  # 使用OpenAI的文本向量化
-                "moduleConfig": {
-                    "text2vec-openai": {
-                        "model": settings.EMBEDDING_MODEL,
-                        "modelVersion": "latest",
-                        "type": "text"
-                    }
-                },
-                "properties": [
-                    {
-                        "name": "content",
-                        "dataType": ["text"],
-                        "description": "简历内容"
-                    },
-                    {
-                        "name": "resumeId",
-                        "dataType": ["int"],
-                        "description": "简历ID"
-                    },
-                    {
-                        "name": "userId",
-                        "dataType": ["int"],
-                        "description": "用户ID"
-                    },
-                    {
-                        "name": "skills",
-                        "dataType": ["text[]"],
-                        "description": "技能列表"
-                    }
-                ]
-            }
-            self.client.schema.create_class(resume_class)
+                logger.error(f"使用LightFM推荐职位时出错: {str(e)}", exc_info=True)
+        else:
+            logger.warning("LightFM模型未就绪，只使用向量搜索进行推荐")
+            # 如果LightFM不可用，调整向量搜索权重为1
+            vector_weight = 1.0
+            lightfm_weight = 0.0
         
-        # 检查并创建Job类
-        if not self.client.schema.exists("Job"):
-            job_class = {
-                "class": "Job",
-                "description": "工作岗位",
-                "vectorizer": "text2vec-openai",  # 使用OpenAI的文本向量化
-                "moduleConfig": {
-                    "text2vec-openai": {
-                        "model": settings.EMBEDDING_MODEL,
-                        "modelVersion": "latest",
-                        "type": "text"
-                    }
-                },
-                "properties": [
-                    {
-                        "name": "content",
-                        "dataType": ["text"],
-                        "description": "岗位内容"
-                    },
-                    {
-                        "name": "jobId",
-                        "dataType": ["int"],
-                        "description": "岗位ID"
-                    },
-                    {
-                        "name": "userId",
-                        "dataType": ["int"],
-                        "description": "发布者ID"
-                    },
-                    {
-                        "name": "isActive",
-                        "dataType": ["boolean"],
-                        "description": "是否活跃"
-                    },
-                    {
-                        "name": "requirements",
-                        "dataType": ["text[]"],
-                        "description": "岗位要求"
-                    }
-                ]
-            }
-            self.client.schema.create_class(job_class)
-    
-    def add_resume(self, resume_id: int, user_id: int, content: str, skills: List[str] = None) -> str:
-        """将简历添加到向量数据库"""
-        if not self.client:
-            if not self.check_connection():
-                raise Exception("Weaviate客户端未初始化且无法重新连接")
+        # 合并结果并计算最终分数
+        merged_recommendations = {}
         
-        # 准备数据
-        data = {
-            "content": content,
-            "resumeId": resume_id,
-            "userId": user_id
-        }
-        
-        if skills:
-            data["skills"] = skills
-        
-        # 添加到Weaviate
-        try:
-            result = self.client.data_object.create(
-                data_object=data,
-                class_name="Resume"
-            )
-            return result  # 返回向量ID
-        except Exception as e:
-            logger.error(f"添加简历到Weaviate失败: {str(e)}")
-            raise
-    
-    def add_job(self, job_id: int, user_id: int, content: str, is_active: bool = True, requirements: List[str] = None) -> str:
-        """将工作岗位添加到向量数据库"""
-        if not self.client:
-            if not self.check_connection():
-                raise Exception("Weaviate客户端未初始化且无法重新连接")
-        
-        # 准备数据
-        data = {
-            "content": content,
-            "jobId": job_id,
-            "userId": user_id,
-            "isActive": is_active
-        }
-        
-        if requirements:
-            data["requirements"] = requirements
-        
-        # 添加到Weaviate
-        try:
-            result = self.client.data_object.create(
-                data_object=data,
-                class_name="Job"
-            )
-            return result  # 返回向量ID
-        except Exception as e:
-            logger.error(f"添加岗位到Weaviate失败: {str(e)}")
-            raise
-    
-    def update_resume(self, vector_id: str, content: str = None, skills: List[str] = None) -> None:
-        """更新简历向量"""
-        if not self.client:
-            if not self.check_connection():
-                raise Exception("Weaviate客户端未初始化且无法重新连接")
-        
-        # 准备更新数据
-        data = {}
-        if content:
-            data["content"] = content
-        if skills:
-            data["skills"] = skills
-        
-        if not data:
-            return  # 没有要更新的内容
-        
-        # 更新Weaviate中的对象
-        try:
-            self.client.data_object.update(
-                uuid=vector_id,
-                data_object=data,
-                class_name="Resume"
-            )
-        except Exception as e:
-            logger.error(f"更新简历向量失败: {str(e)}")
-            raise
-    
-    def update_job(self, vector_id: str, content: str = None, is_active: bool = None, requirements: List[str] = None) -> None:
-        """更新岗位向量"""
-        if not self.client:
-            if not self.check_connection():
-                raise Exception("Weaviate客户端未初始化且无法重新连接")
-        
-        # 准备更新数据
-        data = {}
-        if content:
-            data["content"] = content
-        if is_active is not None:
-            data["isActive"] = is_active
-        if requirements:
-            data["requirements"] = requirements
-        
-        if not data:
-            return  # 没有要更新的内容
-        
-        # 更新Weaviate中的对象
-        try:
-            self.client.data_object.update(
-                uuid=vector_id,
-                data_object=data,
-                class_name="Job"
-            )
-        except Exception as e:
-            logger.error(f"更新岗位向量失败: {str(e)}")
-            raise
-    
-    def get_resume_recommendations(self, job_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-        """基于岗位获取简历推荐"""
-        if not self.client:
-            if not self.check_connection():
-                logger.warning("Weaviate客户端未初始化且无法重新连接")
-                return []
-        
-        try:
-            # 首先获取岗位内容
-            job_result = self.client.query.get(
-                class_name="Job",
-                properties=["content"],
-                where={
-                    "path": ["jobId"],
-                    "operator": "Equal",
-                    "valueNumber": job_id
-                }
-            ).do()
-            
-            if not job_result or not job_result["data"]["Get"]["Job"]:
-                return []
-            
-            job_content = job_result["data"]["Get"]["Job"][0]["content"]
-            
-            # 基于岗位内容推荐简历
-            result = (
-                self.client.query
-                .get("Resume", ["resumeId", "userId", "content", "skills"])
-                .with_near_text({"concepts": [job_content]})
-                .with_limit(limit)
-                .do()
-            )
-            
-            if not result or not result["data"]["Get"]["Resume"]:
-                return []
-            
-            return result["data"]["Get"]["Resume"]
-            
-        except Exception as e:
-            logger.error(f"获取简历推荐失败: {str(e)}")
+        # 检查向量搜索结果是否为空
+        if not vector_recommendations and not lightfm_recommendations:
+            logger.warning(f"没有找到推荐职位，简历ID: {resume_id}")
             return []
-    
-    def get_job_recommendations(self, resume_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-        """基于简历获取岗位推荐"""
-        if not self.client:
-            if not self.check_connection():
-                logger.warning("Weaviate客户端未初始化且无法重新连接")
-                return []
         
+        # 处理向量搜索结果
+        if vector_recommendations:
+            for rec in vector_recommendations:
+                job_id = rec.get("id")
+                if not job_id:
+                    logger.warning("推荐结果中存在没有ID的项，已跳过")
+                    continue
+                
+                # 构建基本信息
+                merged_recommendations[job_id] = {
+                    "id": job_id,
+                    "title": rec.get("title", ""),
+                    "company": rec.get("company", ""),
+                    "match_score": rec.get("match_score", 0) * vector_weight,
+                    "algorithms": ["vector"]
+                }
+                
+                # 如果需要详细信息，添加匹配技能等
+                if include_details:
+                    merged_recommendations[job_id]["match_details"] = {
+                        "similarity": rec.get("similarity", 0),
+                        "skill_score": rec.get("skill_score", 0),
+                        "matched_skills": rec.get("matched_skills", [])
+                    }
+        
+        # 处理LightFM结果
+        if lightfm_recommendations:
+            for rec in lightfm_recommendations:
+                job_id = rec.get("id")
+                if not job_id:
+                    logger.warning("LightFM推荐结果中存在没有ID的项，已跳过")
+                    continue
+                    
+                if job_id in merged_recommendations:
+                    # 如果已存在，更新分数并添加算法
+                    merged_recommendations[job_id]["match_score"] += rec.get("match_score", 0) * lightfm_weight
+                    merged_recommendations[job_id]["algorithms"].append("lightfm")
+                    if include_details and "match_details" in merged_recommendations[job_id]:
+                        merged_recommendations[job_id]["match_details"]["lightfm_score"] = rec.get("match_score", 0)
+                else:
+                    # 如果不存在，添加新条目
+                    merged_recommendations[job_id] = {
+                        "id": job_id,
+                        "title": rec.get("title", ""),
+                        "company": rec.get("company", ""),
+                        "match_score": rec.get("match_score", 0) * lightfm_weight,
+                        "algorithms": ["lightfm"]
+                    }
+                    
+                    if include_details:
+                        merged_recommendations[job_id]["match_details"] = {
+                            "lightfm_score": rec.get("match_score", 0)
+                        }
+        
+        # 转换为列表，按匹配分数排序
+        result = list(merged_recommendations.values())
+        result.sort(key=lambda x: x["match_score"], reverse=True)
+        
+        # 限制结果数量
+        result = result[:limit]
+        
+        # 缓存结果
+        if use_cache and result:
+            # 缓存完整结果而不仅仅是limit限制后的结果
+            cache_job_recommendations(resume_id, result, config_id)
+        
+        processing_time = time.time() - start_time
+        logger.info(f"成功合并向量和LightFM推荐，共返回 {len(result)} 个结果，处理耗时: {processing_time:.3f}秒")
+        return result
+    except Exception as e:
+        logger.error(f"获取推荐职位时出错: {str(e)}", exc_info=True)
+        return []
+
+
+async def get_recommended_resumes(
+    db: Session,
+    job_id: int,
+    limit: int = None,
+    include_details: bool = True,
+    use_cache: bool = DEFAULT_CACHE_ENABLED
+) -> List[Dict[str, Any]]:
+    """
+    获取推荐简历列表
+    
+    Args:
+        db: 数据库会话
+        job_id: 职位ID
+        limit: 返回结果数量限制
+        include_details: 是否包含详细信息
+        use_cache: 是否使用缓存
+        
+    Returns:
+        推荐简历列表
+    """
+    try:
+        start_time = time.time()
+        
+        # 获取当前配置或使用默认值
+        config = recommendation_config.get_active_config(db)
+        if not config:
+            logger.warning("找不到活跃的推荐配置，将创建默认配置")
+            config = recommendation_config.create_default_config(db)
+        
+        # 如果仍没有配置，使用默认值
+        if not config:
+            logger.warning("无法创建默认配置，使用硬编码的默认值")
+            max_recommendations = 10
+            vector_weight = 0.6
+            lightfm_weight = 0.4
+            config_id = 0
+        else:
+            max_recommendations = config.max_recommendations
+            vector_weight = config.vector_weight
+            lightfm_weight = config.lightfm_weight
+            config_id = config.id
+            
+            # 确保权重总和为1
+            if abs(vector_weight + lightfm_weight - 1.0) > 0.001:
+                logger.warning(f"向量权重({vector_weight})和LightFM权重({lightfm_weight})之和不为1，将进行归一化")
+                total = vector_weight + lightfm_weight
+                if total > 0:
+                    vector_weight = vector_weight / total
+                    lightfm_weight = lightfm_weight / total
+                else:
+                    # 如果总和为0或负数，设置默认值
+                    vector_weight = 0.6
+                    lightfm_weight = 0.4
+                    logger.warning(f"权重总和异常，已重置为默认值：向量权重={vector_weight}，LightFM权重={lightfm_weight}")
+        
+        # 应用结果数量限制
+        if limit is None:
+            limit = max_recommendations
+        elif limit <= 0:
+            logger.warning(f"无效的结果数量限制: {limit}，将使用默认值: {max_recommendations}")
+            limit = max_recommendations
+            
+        # 检查缓存
+        if use_cache:
+            cached_results = get_cached_resume_recommendations(job_id, config_id)
+            if cached_results:
+                # 如果缓存有效，直接返回（考虑limit限制）
+                result = cached_results[:limit] if limit < len(cached_results) else cached_results
+                logger.info(f"使用缓存返回职位 {job_id} 的推荐简历，耗时: {time.time() - start_time:.3f}秒")
+                return result
+        
+        # 使用向量搜索获取推荐
+        vector_recommendations = []
         try:
-            # 首先获取简历内容
-            resume_result = self.client.query.get(
-                class_name="Resume",
-                properties=["content"],
-                where={
-                    "path": ["resumeId"],
-                    "operator": "Equal",
-                    "valueNumber": resume_id
-                }
-            ).do()
-            
-            if not resume_result or not resume_result["data"]["Get"]["Resume"]:
-                return []
-            
-            resume_content = resume_result["data"]["Get"]["Resume"][0]["content"]
-            
-            # 基于简历内容推荐岗位
-            result = (
-                self.client.query
-                .get("Job", ["jobId", "userId", "content", "requirements"])
-                .with_near_text({"concepts": [resume_content]})
-                .with_where({
-                    "path": ["isActive"],
-                    "operator": "Equal",
-                    "valueBoolean": True
-                })
-                .with_limit(limit)
-                .do()
-            )
-            
-            if not result or not result["data"]["Get"]["Job"]:
-                return []
-            
-            return result["data"]["Get"]["Job"]
-            
+            vector_recommendations = await get_vector_resume_recommendations(db, job_id, limit=int(limit * 1.5))
+            logger.info(f"向量搜索为职位 {job_id} 找到 {len(vector_recommendations)} 个推荐简历")
         except Exception as e:
-            logger.error(f"获取岗位推荐失败: {str(e)}")
+            logger.error(f"向量搜索推荐简历时出错: {str(e)}", exc_info=True)
+        
+        # 检查LightFM模型是否就绪
+        lightfm_recommendations = []
+        if is_lightfm_ready():
+            try:
+                # 使用LightFM获取推荐
+                lightfm_recommendations = await get_lightfm_resume_recommendations(job_id, db, limit=int(limit * 1.5))
+                logger.info(f"LightFM为职位 {job_id} 找到 {len(lightfm_recommendations)} 个推荐简历")
+            except Exception as e:
+                logger.error(f"使用LightFM推荐简历时出错: {str(e)}", exc_info=True)
+        else:
+            logger.warning("LightFM模型未就绪，只使用向量搜索进行推荐")
+            # 如果LightFM不可用，调整向量搜索权重为1
+            vector_weight = 1.0
+            lightfm_weight = 0.0
+        
+        # 合并结果并计算最终分数
+        merged_recommendations = {}
+        
+        # 检查向量搜索结果是否为空
+        if not vector_recommendations and not lightfm_recommendations:
+            logger.warning(f"没有找到推荐简历，职位ID: {job_id}")
             return []
-
-
-# 创建全局Weaviate客户端实例
-weaviate_client = WeaviateClient()
-
-
-async def index_resume(db: Session, resume: Resume, document_text: str) -> str:
-    """将简历索引到向量数据库"""
-    # 从简历中提取技能（简化实现）
-    skills = []
-    if resume.skills:
-        skills = [skill.strip() for skill in resume.skills.split(",")]
-    
-    # 添加到Weaviate
-    vector_id = weaviate_client.add_resume(
-        resume_id=resume.id,
-        user_id=resume.user_id,
-        content=document_text,
-        skills=skills
-    )
-    
-    return vector_id
-
-
-async def index_job(db: Session, job: Job, document_text: str) -> str:
-    """将岗位索引到向量数据库"""
-    # 从岗位中提取要求（简化实现）
-    requirements = []
-    if job.requirements:
-        # 简单分割处理，实际应用中可能需要更复杂的解析
-        requirements = [req.strip() for req in job.requirements.split("\n") if req.strip()]
-    
-    # 添加到Weaviate
-    vector_id = weaviate_client.add_job(
-        job_id=job.id,
-        user_id=job.user_id,
-        content=document_text,
-        is_active=job.is_active,
-        requirements=requirements
-    )
-    
-    return vector_id
-
-
-async def update_resume_index(vector_id: str, resume: Resume, document_text: str) -> None:
-    """更新简历索引"""
-    # 从简历中提取技能（简化实现）
-    skills = []
-    if resume.skills:
-        skills = [skill.strip() for skill in resume.skills.split(",")]
-    
-    # 更新Weaviate中的简历
-    weaviate_client.update_resume(
-        vector_id=vector_id,
-        content=document_text,
-        skills=skills
-    )
-
-
-async def update_job_index(vector_id: str, job: Job, document_text: str) -> None:
-    """更新岗位索引"""
-    # 从岗位中提取要求（简化实现）
-    requirements = []
-    if job.requirements:
-        requirements = [req.strip() for req in job.requirements.split("\n") if req.strip()]
-    
-    # 更新Weaviate中的岗位
-    weaviate_client.update_job(
-        vector_id=vector_id,
-        content=document_text,
-        is_active=job.is_active,
-        requirements=requirements
-    )
-
-
-async def get_recommended_resumes(db: Session, job_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    获取与指定职位匹配的简历推荐
-    """
-    # 获取职位信息
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        logger.error(f"职位不存在: {job_id}")
-        return []
-    
-    if DEV_MODE:
-        # 开发环境使用模拟数据
-        logger.info(f"开发模式：生成与职位 {job_id} 匹配的模拟简历数据")
         
-        # 获取所有简历以模拟推荐
-        resumes = db.query(Resume).limit(limit).all()
-        result = []
-        
-        for i, resume in enumerate(resumes):
-            # 模拟匹配分数和细节
-            match_score = min(100, 90 - i * 5)  # 递减的匹配分数
-            
-            # 构建推荐结果
-            result.append({
-                "resume_id": resume.id,
-                "match_score": match_score,
-                "match_details": {
-                    "skills_match": min(100, match_score + 5),
-                    "experience_match": min(100, match_score - 5),
-                    "education_match": min(100, match_score + 10)
-                },
-                "resume": {
-                    "id": resume.id,
-                    "name": resume.name if hasattr(resume, 'name') else f"求职者-{resume.id}",
-                    "skills": resume.skills if hasattr(resume, 'skills') and resume.skills else ["Python", "数据分析", "机器学习"],
-                    "education": resume.education if hasattr(resume, 'education') else "本科",
-                    "experience": resume.experience if hasattr(resume, 'experience') else "3年",
+        # 处理向量搜索结果
+        if vector_recommendations:
+            for rec in vector_recommendations:
+                resume_id = rec.get("id")
+                if not resume_id:
+                    logger.warning("推荐结果中存在没有ID的项，已跳过")
+                    continue
+                
+                # 构建基本信息
+                merged_recommendations[resume_id] = {
+                    "id": resume_id,
+                    "title": rec.get("title", ""),
+                    "user": rec.get("user", {}),
+                    "match_score": rec.get("match_score", 0) * vector_weight,
+                    "algorithms": ["vector"]
                 }
-            })
+                
+                # 如果需要详细信息，添加匹配技能等
+                if include_details:
+                    merged_recommendations[resume_id]["match_details"] = {
+                        "similarity": rec.get("similarity", 0),
+                        "skill_score": rec.get("skill_score", 0),
+                        "matched_skills": rec.get("matched_skills", [])
+                    }
         
+        # 处理LightFM结果
+        if lightfm_recommendations:
+            for rec in lightfm_recommendations:
+                resume_id = rec.get("id")
+                if not resume_id:
+                    logger.warning("LightFM推荐结果中存在没有ID的项，已跳过")
+                    continue
+                
+                if resume_id in merged_recommendations:
+                    # 如果已存在，更新分数并添加算法
+                    merged_recommendations[resume_id]["match_score"] += rec.get("match_score", 0) * lightfm_weight
+                    merged_recommendations[resume_id]["algorithms"].append("lightfm")
+                    if include_details and "match_details" in merged_recommendations[resume_id]:
+                        merged_recommendations[resume_id]["match_details"]["lightfm_score"] = rec.get("match_score", 0)
+                else:
+                    # 如果不存在，添加新条目
+                    merged_recommendations[resume_id] = {
+                        "id": resume_id,
+                        "title": rec.get("title", ""),
+                        "user": rec.get("user", {}),
+                        "match_score": rec.get("match_score", 0) * lightfm_weight,
+                        "algorithms": ["lightfm"]
+                    }
+                    
+                    if include_details:
+                        merged_recommendations[resume_id]["match_details"] = {
+                            "lightfm_score": rec.get("match_score", 0)
+                        }
+        
+        # 转换为列表，按匹配分数排序
+        result = list(merged_recommendations.values())
+        result.sort(key=lambda x: x["match_score"], reverse=True)
+        
+        # 限制结果数量
+        result = result[:limit]
+        
+        # 缓存结果
+        if use_cache and result:
+            # 缓存完整结果
+            cache_resume_recommendations(job_id, result, config_id)
+        
+        processing_time = time.time() - start_time
+        logger.info(f"成功合并向量和LightFM推荐，共返回 {len(result)} 个结果，处理耗时: {processing_time:.3f}秒")
         return result
-    
-    # 生产环境使用Weaviate进行向量搜索
-    if not weaviate_client:
-        logger.error("Weaviate客户端未初始化")
-        return []
-    
-    try:
-        # 这里实现Weaviate搜索逻辑
-        # ...
-        pass
     except Exception as e:
-        logger.error(f"获取简历推荐时发生错误: {str(e)}")
-        return []
-
-
-async def get_recommended_jobs(db: Session, resume_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    获取与指定简历匹配的职位推荐
-    """
-    # 获取简历信息
-    resume = db.query(Resume).filter(Resume.id == resume_id).first()
-    if not resume:
-        logger.error(f"简历不存在: {resume_id}")
-        return []
-    
-    if DEV_MODE:
-        # 开发环境使用模拟数据
-        logger.info(f"开发模式：生成与简历 {resume_id} 匹配的模拟职位数据")
-        
-        # 获取所有职位以模拟推荐
-        jobs = db.query(Job).filter(Job.is_active == True).limit(limit).all()
-        result = []
-        
-        for i, job in enumerate(jobs):
-            # 模拟匹配分数和细节
-            match_score = min(100, 95 - i * 5)  # 递减的匹配分数
-            
-            # 构建推荐结果
-            result.append({
-                "job_id": job.id,
-                "match_score": match_score,
-                "match_details": {
-                    "skills_match": min(100, match_score + 5),
-                    "requirements_match": min(100, match_score - 10),
-                    "location_match": min(100, match_score + 2)
-                },
-                "job": {
-                    "id": job.id,
-                    "title": job.title,
-                    "company_name": job.company_name,
-                    "location": job.location,
-                    "job_type": job.job_type,
-                    "salary_range": job.salary_range,
-                    "is_active": job.is_active,
-                    "created_at": job.created_at.isoformat() if job.created_at else None,
-                }
-            })
-        
-        return result
-    
-    # 生产环境使用Weaviate进行向量搜索
-    if not weaviate_client:
-        logger.error("Weaviate客户端未初始化")
-        return []
-    
-    try:
-        # 这里实现Weaviate搜索逻辑
-        # ...
-        pass
-    except Exception as e:
-        logger.error(f"获取职位推荐时发生错误: {str(e)}")
+        logger.error(f"获取推荐简历时出错: {str(e)}", exc_info=True)
         return [] 

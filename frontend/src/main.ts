@@ -9,6 +9,7 @@ import App from './App.vue';
 import router from './router';
 
 import './assets/main.css';
+import LogViewer from './components/common/LogViewer.vue';
 
 // 创建Vue应用实例
 const app = createApp(App);
@@ -17,6 +18,9 @@ const app = createApp(App);
 for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
   app.component(key, component);
 }
+
+// 全局注册LogViewer组件
+app.component('LogViewer', LogViewer);
 
 // 使用Pinia状态管理
 app.use(createPinia());

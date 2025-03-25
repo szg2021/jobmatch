@@ -22,21 +22,11 @@
 
     <!-- 搜索框 -->
     <div class="search-section">
-      <SearchBox
-        v-model="searchQuery"
-        placeholder="搜索职位名称、公司等"
-        @search="fetchJobs"
+      <AIChatSearchBox
+        @search="handleAISearch"
+        @chat-update="updateChatHistory"
+        context="我是您的AI招聘助手，可以帮您找到最匹配的职位。请描述您想找的职位类型、技能要求或其他条件。"
       />
-      
-      <el-button 
-        type="primary" 
-        plain 
-        class="advanced-search-btn"
-        @click="toggleAdvancedSearch"
-      >
-        {{ showAdvancedSearch ? '隐藏高级搜索' : '高级搜索' }}
-        <el-icon><ArrowDown v-if="!showAdvancedSearch" /><ArrowUp v-else /></el-icon>
-      </el-button>
     </div>
     
     <!-- 高级搜索面板 -->
@@ -98,15 +88,15 @@
           </el-form-item>
           
           <el-form-item>
-            <el-button type="primary" @click="applyAdvancedFilters">应用筛选</el-button>
-            <el-button @click="resetAdvancedFilters">重置</el-button>
+            <el-button type="primary" @click="handleFilterChange">应用筛选</el-button>
+            <el-button @click="resetFilters">重置</el-button>
           </el-form-item>
         </el-form>
       </div>
     </el-collapse-transition>
 
     <!-- 职位列表 -->
-    <div class="job-list">
+    <div class="job-list" v-loading="loadingState.state.jobsList">
       <template v-if="jobs.length > 0">
         <div 
           class="job-card" 
@@ -165,35 +155,34 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, reactive } from 'vue';
+import { ref, onMounted, reactive, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { 
   More, 
   CirclePlus, 
-  Search, 
   Bell,
   ArrowDown,
   ArrowUp
 } from '@element-plus/icons-vue';
 import api from '@/utils/api';
 import { formatDate } from '@/utils/helpers';
-import { useLoading } from '@/utils/loadingState';
+import loadingState from '@/utils/loadingState';
 import { useUserStore } from '@/store/user';
 import type { Job } from '@/types';
 import BottomNavigation from '@/components/layout/BottomNavigation.vue';
 import PageContentWrapper from '@/components/layout/PageContentWrapper.vue';
-import SearchBox from '@/components/common/SearchBox.vue';
+import AIChatSearchBox from '@/components/common/AIChatSearchBox.vue';
 import StatusTag from '@/components/common/StatusTag.vue';
 import LogViewer from '@/components/debug/LogViewer.vue';
-import logger from '@/utils/logger';
+import { logger } from '@/utils/logger';
 
 const router = useRouter();
-const loadingState = useLoading();
 const userStore = useUserStore();
 const jobs = ref<Job[]>([]);
 const searchQuery = ref('');
 const logViewerRef = ref(null);
+const chatHistory = ref([]);
 
 // 高级搜索相关
 const showAdvancedSearch = ref(false);
@@ -236,140 +225,55 @@ const toggleAdvancedSearch = () => {
   showAdvancedSearch.value = !showAdvancedSearch.value;
 };
 
-// 应用高级筛选
-const applyAdvancedFilters = () => {
-  fetchJobs();
+// 更新事件处理函数
+const handleSearch = () => {
+  logger.info('执行搜索查询', searchQuery.value);
+  applyFilters();
 };
 
-// 重置高级筛选
-const resetAdvancedFilters = () => {
-  Object.assign(advancedFilters, {
-    jobType: '',
-    location: '',
-    experience: '',
-    salary: '',
-    skills: []
-  });
-  fetchJobs();
+const handleFilterChange = () => {
+  logger.info('高级筛选条件已更改', advancedFilters);
+  applyFilters();
+};
+
+// 重置筛选器
+const resetFilters = () => {
+  logger.info('重置所有筛选条件');
+  searchQuery.value = '';
+  advancedFilters.jobType = '';
+  advancedFilters.location = '';
+  advancedFilters.experience = '';
+  advancedFilters.salary = '';
+  advancedFilters.skills = [];
+  applyFilters();
+};
+
+// 在setup函数内替换加载逻辑
+const isLoading = computed(() => loadingState.state.jobsList);
+const fetchJobsList = async () => {
+  try {
+    logger.info('开始获取职位列表');
+    await loadingState.withLoadingSafe('jobsList', async () => {
+      logger.info('模拟API请求延迟...');
+      // 模拟API延迟
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // 这里可以添加真正的API调用
+      // const response = await axios.get('/api/jobs');
+      // jobs.value = response.data;
+      
+      logger.success('已成功加载模拟职位数据');
+    }, null, { enabled: true, duration: 1000 });
+  } catch (error) {
+    logger.error('获取职位列表失败，将使用模拟数据', error);
+  }
 };
 
 // 获取职位列表
 const fetchJobs = async () => {
-  try {
-    logger.info('开始获取职位列表数据');
-    
-    // 直接使用静态数据，不尝试调用API
-    jobs.value = [
-      {
-        job_id: '1',
-        title: '前端开发工程师',
-        company_name: '科技有限公司',
-        location: '北京',
-        job_type: '全职',
-        salary_range: '15k-25k',
-        description: '负责公司产品的前端开发...',
-        requirements: ['JavaScript', 'Vue.js', 'React'],
-        is_active: true,
-        created_at: new Date().toISOString(),
-        applicants: 25
-      },
-      {
-        job_id: '2',
-        title: '产品经理',
-        company_name: '互联网科技公司',
-        location: '上海',
-        job_type: '全职',
-        salary_range: '20k-30k',
-        description: '负责产品规划与设计...',
-        requirements: ['产品设计', '需求分析', '用户研究'],
-        is_active: true,
-        created_at: new Date().toISOString(),
-        applicants: 18
-      },
-      {
-        job_id: '3',
-        title: 'Java后端开发工程师',
-        company_name: '金融科技有限公司',
-        location: '深圳',
-        job_type: '全职',
-        salary_range: '25k-35k',
-        description: '负责系统后端开发与优化...',
-        requirements: ['Java', 'Spring Boot', 'MySQL'],
-        is_active: true,
-        created_at: new Date().toISOString(),
-        applicants: 32
-      },
-      {
-        job_id: '4',
-        title: 'UI/UX设计师',
-        company_name: '设计创意公司',
-        location: '杭州',
-        job_type: '全职',
-        salary_range: '12k-20k',
-        description: '负责产品界面设计与用户体验优化...',
-        requirements: ['Figma', 'Adobe XD', '用户研究'],
-        is_active: true,
-        created_at: new Date().toISOString(),
-        applicants: 15
-      }
-    ];
-    
-    logger.success('已成功加载职位数据');
-    
-    // 如果有搜索或筛选条件，可以在客户端进行过滤
-    if (searchQuery.value || 
-        advancedFilters.jobType || 
-        advancedFilters.location || 
-        advancedFilters.experience || 
-        advancedFilters.salary || 
-        advancedFilters.skills.length > 0) {
-      
-      logger.info('正在应用筛选条件', { 
-        searchQuery: searchQuery.value,
-        filters: { ...advancedFilters }
-      });
-      
-      jobs.value = jobs.value.filter(job => {
-        // 搜索查询筛选
-        const matchesSearch = !searchQuery.value || 
-          job.title.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
-          job.company_name.toLowerCase().includes(searchQuery.value.toLowerCase());
-        
-        if (!matchesSearch) return false;
-        
-        // 职位类型筛选
-        const matchesJobType = !advancedFilters.jobType || 
-          job.job_type === advancedFilters.jobType;
-        
-        if (!matchesJobType) return false;
-        
-        // 地点筛选
-        const matchesLocation = !advancedFilters.location || 
-          job.location.includes(advancedFilters.location);
-        
-        if (!matchesLocation) return false;
-        
-        // 技能筛选
-        const matchesSkills = advancedFilters.skills.length === 0 || 
-          advancedFilters.skills.some(skill => 
-            job.requirements && job.requirements.includes(skill)
-          );
-        
-        if (!matchesSkills) return false;
-        
-        return true;
-      });
-      
-      logger.info(`筛选后剩余职位: ${jobs.value.length}个`);
-    }
-    
-    // 模拟API延迟 (添加短暂延迟以提供更好的用户体验)
-    await new Promise(resolve => setTimeout(resolve, 300));
-    
-  } catch (error) {
-    logger.error('职位列表加载过程发生异常', error);
-    ElMessage.error('加载职位信息时发生错误');
-  }
+  await fetchJobsList();
+  // 使用本地模拟数据
+  applyFilters();
 };
 
 // 职位卡片点击处理
@@ -419,6 +323,205 @@ const handleApply = (event: Event, job: Job) => {
   
   // 这里添加立即报名的逻辑
   ElMessage.success(`已报名职位: ${job.title}`);
+};
+
+// 添加模拟数据
+const mockJobs = [
+  {
+    job_id: '1',
+    title: '前端开发工程师',
+    company_name: '科技有限公司',
+    location: '北京',
+    job_type: '全职',
+    salary_range: '15k-25k',
+    description: '负责公司产品的前端开发...',
+    requirements: ['JavaScript', 'Vue.js', 'React'],
+    is_active: true,
+    created_at: new Date().toISOString(),
+    applicants: 25
+  },
+  {
+    job_id: '2',
+    title: '产品经理',
+    company_name: '互联网科技公司',
+    location: '上海',
+    job_type: '全职',
+    salary_range: '20k-30k',
+    description: '负责产品规划与设计...',
+    requirements: ['产品设计', '需求分析', '用户研究'],
+    is_active: true,
+    created_at: new Date().toISOString(),
+    applicants: 18
+  },
+  {
+    job_id: '3',
+    title: 'Java后端开发工程师',
+    company_name: '金融科技有限公司',
+    location: '深圳',
+    job_type: '全职',
+    salary_range: '25k-35k',
+    description: '负责系统后端开发与优化...',
+    requirements: ['Java', 'Spring Boot', 'MySQL'],
+    is_active: true,
+    created_at: new Date().toISOString(),
+    applicants: 32
+  },
+  {
+    job_id: '4',
+    title: 'UI/UX设计师',
+    company_name: '设计创意公司',
+    location: '杭州',
+    job_type: '全职',
+    salary_range: '12k-20k',
+    description: '负责产品界面设计与用户体验优化...',
+    requirements: ['Figma', 'Adobe XD', '用户研究'],
+    is_active: true,
+    created_at: new Date().toISOString(),
+    applicants: 15
+  }
+];
+
+// 根据AI解析的条件进行搜索
+const handleAISearch = (query: string, parsedCriteria: any) => {
+  logger.info('AI搜索条件', { query, parsedCriteria });
+  
+  // 重置高级搜索面板状态
+  showAdvancedSearch.value = false;
+  
+  // 应用AI解析的搜索条件
+  if (parsedCriteria.skills && Array.isArray(parsedCriteria.skills)) {
+    advancedFilters.skills = parsedCriteria.skills;
+  }
+  
+  if (parsedCriteria.jobType) {
+    advancedFilters.jobType = parsedCriteria.jobType;
+  }
+  
+  if (parsedCriteria.location) {
+    advancedFilters.location = parsedCriteria.location;
+  }
+  
+  // 语义搜索处理
+  searchQuery.value = query;
+  
+  // 触发搜索
+  applyFilters(true);
+};
+
+// 更新聊天历史
+const updateChatHistory = (history) => {
+  chatHistory.value = history;
+  // 可以保存到本地存储或进行其他处理
+};
+
+// 修改应用筛选函数，添加语义搜索参数
+const applyFilters = (isSemanticSearch = false) => {
+  logger.info('正在应用筛选条件', { 
+    searchQuery: searchQuery.value,
+    filters: { ...advancedFilters },
+    isSemanticSearch
+  });
+  
+  // 首先使用模拟数据
+  jobs.value = [...mockJobs];
+  
+  // 然后应用筛选
+  if (searchQuery.value || 
+      advancedFilters.jobType || 
+      advancedFilters.location || 
+      advancedFilters.experience || 
+      advancedFilters.salary || 
+      advancedFilters.skills.length > 0) {
+    
+    // 如果是语义搜索，使用更智能的匹配算法
+    if (isSemanticSearch) {
+      // 模拟AI语义搜索的匹配逻辑
+      // 实际项目中，这里应该调用后端API进行语义匹配
+      jobs.value = jobs.value.filter(job => {
+        // 基于职位描述和要求的语义相似度匹配
+        // 这里使用简化的模拟算法
+        const searchTerms = searchQuery.value.toLowerCase().split(' ');
+        const jobText = [
+          job.title,
+          job.company_name, 
+          job.location, 
+          job.description,
+          ...(job.requirements || [])
+        ].join(' ').toLowerCase();
+        
+        // 计算简单的相关性分数
+        let relevanceScore = 0;
+        searchTerms.forEach(term => {
+          if (jobText.includes(term)) {
+            relevanceScore += 1;
+          }
+        });
+        
+        // 技能匹配增加额外的相关性
+        if (advancedFilters.skills.length > 0 && job.requirements) {
+          advancedFilters.skills.forEach(skill => {
+            if (job.requirements.includes(skill)) {
+              relevanceScore += 2;
+            }
+          });
+        }
+        
+        // 职位类型精确匹配
+        if (advancedFilters.jobType && job.job_type === advancedFilters.jobType) {
+          relevanceScore += 3;
+        }
+        
+        // 地点匹配
+        if (advancedFilters.location && job.location.includes(advancedFilters.location)) {
+          relevanceScore += 2;
+        }
+        
+        // 返回相关性分数大于0的职位
+        return relevanceScore > 0;
+      });
+      
+      // 按相关性排序（实际项目中，排序应该由后端完成）
+      jobs.value.sort((a, b) => {
+        // 这里模拟一个简单的相关性排序
+        // 将热门职位排在前面
+        return (b.applicants || 0) - (a.applicants || 0);
+      });
+    } else {
+      // 传统的关键字过滤
+      jobs.value = jobs.value.filter(job => {
+        // 搜索查询筛选
+        const matchesSearch = !searchQuery.value || 
+          job.title.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
+          job.company_name.toLowerCase().includes(searchQuery.value.toLowerCase());
+        
+        if (!matchesSearch) return false;
+        
+        // 职位类型筛选
+        const matchesJobType = !advancedFilters.jobType || 
+          job.job_type === advancedFilters.jobType;
+        
+        if (!matchesJobType) return false;
+        
+        // 地点筛选
+        const matchesLocation = !advancedFilters.location || 
+          job.location.includes(advancedFilters.location);
+        
+        if (!matchesLocation) return false;
+        
+        // 技能筛选
+        const matchesSkills = advancedFilters.skills.length === 0 || 
+          advancedFilters.skills.some(skill => 
+            job.requirements && job.requirements.includes(skill)
+          );
+        
+        if (!matchesSkills) return false;
+        
+        return true;
+      });
+    }
+    
+    logger.info(`筛选后剩余职位: ${jobs.value.length}个`);
+  }
 };
 
 // 组件挂载后注册日志组件实例

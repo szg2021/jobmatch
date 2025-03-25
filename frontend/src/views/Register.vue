@@ -173,7 +173,7 @@ const submitForm = async () => {
     if (valid) {
       await handleRegister();
     } else {
-      console.log('错误字段:', fields);
+      showError(fields);
     }
   });
 };
@@ -209,6 +209,11 @@ const handleRegister = async () => {
   } finally {
     loading.value = false;
   }
+};
+
+const showError = (fields: string[]) => {
+  error.value = true;
+  errorFields.value = fields;
 };
 </script>
 

@@ -109,9 +109,14 @@ const submitForm = async () => {
     if (valid) {
       await handleLogin();
     } else {
-      console.log('错误字段:', fields);
+      showError(fields);
     }
   });
+};
+
+const showError = (fields: string[]) => {
+  error.value = true;
+  errorFields.value = fields;
 };
 
 const handleLogin = async () => {

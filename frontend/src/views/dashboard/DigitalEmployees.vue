@@ -10,6 +10,23 @@
 
     <div class="subtitle">AI数字员工市场</div>
 
+    <!-- 添加AI搜索框 -->
+    <div class="search-section">
+      <AIChatSearchBox
+        @search="handleAISearch"
+        @chat-update="updateChatHistory"
+        placeholder="请描述您需要的数字员工类型或功能..."
+        buttonText="搜索智能体"
+        context="我是您的AI助手，可以帮您找到适合的数字员工。请描述您的业务需求、场景或希望解决的问题。"
+        :searchExamples="[
+          '我需要一个能解析简历的助手',
+          '有没有可以帮忙匹配职位的智能体？',
+          '我想要一个能生成面试问题的工具',
+          '寻找能做背景调查的数字员工'
+        ]"
+      />
+    </div>
+
     <!-- 顶部标签导航 -->
     <div class="tabs-container">
       <div class="tab active">智能Agent</div>
@@ -20,144 +37,42 @@
     </div>
 
     <!-- AI员工列表 -->
-    <div class="employee-list">
-      <!-- 智能助手 -->
-      <div class="employee-card">
-        <div class="employee-header">
-          <el-radio v-model="selectedEmployee" label="assistant" class="radio-select">智能助手</el-radio>
+    <div class="employees-container" v-loading="isLoading">
+      <!-- 遍历智能体列表 -->
+      <div v-for="agent in agents" :key="agent.id" class="employee-card">
+        <div class="employee-icon">
+          <el-icon size="36"><component :is="agent.icon" /></el-icon>
         </div>
-        <div class="employee-content">
-          <div class="employee-description">
-            全能型问答助手，处理各种自然语言任务和知识问答
+        <div class="employee-info">
+          <div class="employee-header">
+            <h3 class="employee-name">{{ agent.name }}</h3>
+            <el-tag v-if="agent.isPopular" size="small" type="danger">热门</el-tag>
           </div>
-          <div class="employee-stats">
-            <div class="stat-item">
-              <el-icon><View /></el-icon>
-              <span>12875</span>
+          <p class="employee-category">{{ agent.category }}</p>
+          <p class="employee-desc">{{ agent.description }}</p>
+          <div class="employee-footer">
+            <div class="employee-stats">
+              <span class="usage-count">
+                <el-icon><user /></el-icon>
+                {{ agent.usageCount }}人使用
+              </span>
+              <span class="rating">
+                <el-rate
+                  v-model="agent.rating"
+                  disabled
+                  text-color="#ff9900"
+                  score-template="{value}"
+                  :show-score="true"
+                ></el-rate>
+              </span>
             </div>
-            <div class="stat-item">
-              <el-icon><Star /></el-icon>
-              <span>9834</span>
-            </div>
-          </div>
-        </div>
-        <div class="employee-footer">
-          <div class="employee-icon">
-            <el-icon><School /></el-icon>
-          </div>
-          <el-button 
-            type="danger" 
-            round 
-            class="try-button"
-            @click="handleUseEmployee('assistant')"
-          >
-            立即使用
-          </el-button>
-        </div>
-      </div>
-
-      <!-- 代码助手 -->
-      <div class="employee-card">
-        <div class="employee-header">
-          <el-radio v-model="selectedEmployee" label="coder" class="radio-select">代码助手</el-radio>
-        </div>
-        <div class="employee-content">
-          <div class="employee-description">
-            专业代码生成与优化，支持多种编程语言和框架
-          </div>
-          <div class="employee-stats">
-            <div class="stat-item">
-              <el-icon><View /></el-icon>
-              <span>8645</span>
-            </div>
-            <div class="stat-item">
-              <el-icon><Star /></el-icon>
-              <span>7321</span>
+            <div class="employee-actions">
+              <el-button @click="likeAgent(agent.id)" type="text" size="small">
+                <el-icon><ThumbUp /></el-icon>
+              </el-button>
+              <el-button @click="handleUseEmployee(agent.name)" type="primary" size="small" plain>使用</el-button>
             </div>
           </div>
-        </div>
-        <div class="employee-footer">
-          <div class="employee-icon ai-icon">
-            <span>AI</span>
-          </div>
-          <el-button 
-            type="danger" 
-            round 
-            class="try-button"
-            @click="handleUseEmployee('coder')"
-          >
-            立即使用
-          </el-button>
-        </div>
-      </div>
-
-      <!-- 文档分析师 -->
-      <div class="employee-card">
-        <div class="employee-header">
-          <el-radio v-model="selectedEmployee" label="document-analyst" class="radio-select">文档分析师</el-radio>
-        </div>
-        <div class="employee-content">
-          <div class="employee-description">
-            智能分析文档内容，提取关键信息并生成摘要
-          </div>
-          <div class="employee-stats">
-            <div class="stat-item">
-              <el-icon><View /></el-icon>
-              <span>7432</span>
-            </div>
-            <div class="stat-item">
-              <el-icon><Star /></el-icon>
-              <span>6154</span>
-            </div>
-          </div>
-        </div>
-        <div class="employee-footer">
-          <div class="employee-icon doc-icon">
-            <el-icon><Document /></el-icon>
-          </div>
-          <el-button 
-            type="danger" 
-            round 
-            class="try-button"
-            @click="handleUseEmployee('document-analyst')"
-          >
-            立即使用
-          </el-button>
-        </div>
-      </div>
-
-      <!-- 智能翻译官 -->
-      <div class="employee-card">
-        <div class="employee-header">
-          <el-radio v-model="selectedEmployee" label="translator" class="radio-select">智能翻译官</el-radio>
-        </div>
-        <div class="employee-content">
-          <div class="employee-description">
-            高质量多语言翻译，保留原文语义与风格
-          </div>
-          <div class="employee-stats">
-            <div class="stat-item">
-              <el-icon><View /></el-icon>
-              <span>6543</span>
-            </div>
-            <div class="stat-item">
-              <el-icon><Star /></el-icon>
-              <span>5421</span>
-            </div>
-          </div>
-        </div>
-        <div class="employee-footer">
-          <div class="employee-icon translator-icon">
-            <el-icon><User /></el-icon>
-          </div>
-          <el-button 
-            type="danger" 
-            round 
-            class="try-button"
-            @click="handleUseEmployee('translator')"
-          >
-            立即使用
-          </el-button>
         </div>
       </div>
     </div>
@@ -171,7 +86,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, computed } from 'vue';
 import { useRouter } from 'vue-router';
 import { ElMessage } from 'element-plus';
 import { 
@@ -181,27 +96,101 @@ import {
   Star,
   School,
   Document,
-  User
+  User,
+  ThumbUp
 } from '@element-plus/icons-vue';
-import { useLoading } from '@/utils/loadingState';
+import loadingState from '@/utils/loadingState';
 import { useUserStore } from '@/store/user';
 import BottomNavigation from '@/components/layout/BottomNavigation.vue';
 import PageContentWrapper from '@/components/layout/PageContentWrapper.vue';
+import AIChatSearchBox from '@/components/common/AIChatSearchBox.vue';
 import LogViewer from '@/components/debug/LogViewer.vue';
-import logger from '@/utils/logger';
+import { logger } from '@/utils/logger';
 
 const router = useRouter();
-const loadingState = useLoading();
 const userStore = useUserStore();
 const selectedEmployee = ref('');
 const logViewerRef = ref(null);
+const agents = ref([]);
+const chatHistory = ref([]);
 
-// 处理使用数字员工
-const handleUseEmployee = (employeeType: string) => {
-  logger.info(`尝试使用数字员工: ${employeeType}`);
+// 模拟数据
+const mockAgents = [
+  {
+    id: 1,
+    name: '智能简历解析助手',
+    category: '文档处理',
+    icon: 'Document',
+    description: '自动解析简历内容，提取关键信息，为HR提供便捷的简历管理工具',
+    usageCount: 1857,
+    rating: 4.8,
+    isPopular: true
+  },
+  {
+    id: 2,
+    name: '职位匹配推荐师',
+    category: '推荐系统',
+    icon: 'Connection',
+    description: '基于简历内容和职位要求，智能匹配最合适的候选人和职位',
+    usageCount: 2103,
+    rating: 4.6,
+    isPopular: true
+  },
+  {
+    id: 3,
+    name: '面试问题生成器',
+    category: '内容生成',
+    icon: 'ChatDotRound',
+    description: '根据职位要求和候选人简历，自动生成针对性的面试问题',
+    usageCount: 1580,
+    rating: 4.5,
+    isPopular: false
+  },
+  {
+    id: 4,
+    name: '背景调查助手',
+    category: '信息收集',
+    icon: 'Search',
+    description: '帮助HR进行候选人背景信息收集和验证，提高招聘决策准确性',
+    usageCount: 982,
+    rating: 4.2,
+    isPopular: false
+  }
+];
+
+// 使用计算属性获取加载状态
+const isLoading = computed(() => loadingState.state.agentsList);
+
+// 获取智能体数据
+const fetchAgentsList = async () => {
+  try {
+    logger.info('开始获取智能体列表');
+    await loadingState.withLoadingSafe('agentsList', async () => {
+      logger.info('模拟API请求延迟...');
+      // 模拟API延迟
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
+      // 这里可以添加真正的API调用
+      // const response = await axios.get('/api/agents');
+      // agents.value = response.data;
+      
+      // 使用模拟数据
+      agents.value = [...mockAgents];
+      
+      logger.success('已成功加载智能体数据');
+    }, null, { enabled: true, duration: 500 });
+  } catch (error) {
+    logger.error('获取智能体列表失败', error);
+    // 使用模拟数据作为后备
+    agents.value = [...mockAgents];
+  }
+};
+
+// 使用数字员工
+const useEmployee = (employeeType: string) => {
+  logger.info(`正在启动数字员工: ${employeeType}`);
   
   if (!userStore.isLoggedIn) {
-    logger.warning('用户未登录，重定向到登录页面');
     ElMessage.warning('请先登录后使用数字员工');
     router.push({
       path: '/login',
@@ -210,45 +199,111 @@ const handleUseEmployee = (employeeType: string) => {
     return;
   }
   
-  // 这里添加使用数字员工的逻辑
-  logger.success(`开始使用数字员工: ${employeeType}`);
-  ElMessage.success(`开始使用数字员工: ${employeeType}`);
+  // 模拟跳转到对话或使用界面的逻辑
+  ElMessage.success(`已启动 ${employeeType}，正在初始化...`);
   
-  // 根据不同类型的数字员工执行不同的操作
-  switch (employeeType) {
-    case 'assistant':
-      // 使用智能助手
-      logger.info('启动智能助手服务');
-      break;
-    case 'coder':
-      // 使用代码助手
-      logger.info('启动代码助手服务');
-      break;
-    case 'document-analyst':
-      // 使用文档分析师
-      logger.info('启动文档分析服务');
-      break;
-    case 'translator':
-      // 使用智能翻译官
-      logger.info('启动翻译服务');
-      break;
-    default:
-      logger.warning(`未知的数字员工类型: ${employeeType}`);
-      break;
+  // 实际项目中应该跳转到对应的智能体界面或打开对话窗口
+  setTimeout(() => {
+    router.push({
+      path: '/dashboard/agent-workspace',
+      query: { 
+        agent: encodeURIComponent(employeeType),
+        mode: 'conversation'
+      }
+    });
+  }, 1000);
+};
+
+// 替换handleUseEmployee函数
+const handleUseEmployee = (employeeType) => {
+  useEmployee(employeeType);
+};
+
+// 点赞功能
+const likeAgent = (agentId) => {
+  logger.info(`给智能体ID:${agentId}点赞`);
+  ElMessage.success('感谢您的反馈！');
+  
+  // 这里可以添加真正的API调用来更新点赞数
+  // 这里仅模拟更新本地数据
+  const agent = agents.value.find(a => a.id === agentId);
+  if (agent) {
+    agent.rating = Math.min(5, agent.rating + 0.1);
+    agent.usageCount += 1;
   }
+};
+
+// 处理AI搜索
+const handleAISearch = (query: string, parsedCriteria: any) => {
+  logger.info('AI搜索条件', { query, parsedCriteria });
+  
+  // 使用模拟数据
+  agents.value = [...mockAgents];
+  
+  // 基于AI解析的条件过滤
+  if (query) {
+    // 简单的相关性匹配逻辑 (实际应通过后端API实现)
+    agents.value = agents.value.filter(agent => {
+      // 将搜索内容转为关键词
+      const searchTerms = query.toLowerCase().split(' ');
+      
+      // 合并代理的所有文本信息
+      const agentText = [
+        agent.name,
+        agent.category,
+        agent.description
+      ].join(' ').toLowerCase();
+      
+      // 计算简单的匹配分数
+      let matchScore = 0;
+      
+      // 关键词匹配
+      searchTerms.forEach(term => {
+        if (agentText.includes(term)) {
+          matchScore += 1;
+        }
+      });
+      
+      // 类别精确匹配
+      if (parsedCriteria.category && agent.category.includes(parsedCriteria.category)) {
+        matchScore += 2;
+      }
+      
+      // 特定功能匹配
+      if (parsedCriteria.function) {
+        if (agent.description.toLowerCase().includes(parsedCriteria.function.toLowerCase())) {
+          matchScore += 3;
+        }
+      }
+      
+      // 返回匹配分数大于0的数字员工
+      return matchScore > 0;
+    });
+    
+    // 按热门程度排序
+    agents.value.sort((a, b) => {
+      // 首先按是否热门排序
+      if (a.isPopular && !b.isPopular) return -1;
+      if (!a.isPopular && b.isPopular) return 1;
+      
+      // 然后按使用人数排序
+      return b.usageCount - a.usageCount;
+    });
+    
+    logger.info(`筛选后的数字员工数量: ${agents.value.length}`);
+  }
+};
+
+// 更新聊天历史
+const updateChatHistory = (history) => {
+  chatHistory.value = history;
+  // 可以保存到本地存储或进行其他处理
 };
 
 // 初始化页面
 onMounted(() => {
-  logger.info('DigitalEmployees页面加载中...');
-  
-  // 不使用loading状态，直接加载静态数据
-  logger.info('加载数字员工数据');
-  
-  // 模拟短暂的加载过程
-  setTimeout(() => {
-    logger.success('数字员工数据加载完成');
-  }, 300);
+  fetchAgentsList();
+  logger.info('DigitalEmployees页面已加载');
   
   // 注册日志组件实例
   if (logViewerRef.value) {
@@ -300,6 +355,10 @@ onMounted(() => {
   margin-bottom: 16px;
 }
 
+.search-section {
+  margin-bottom: 16px;
+}
+
 .tabs-container {
   display: flex;
   overflow-x: auto;
@@ -329,7 +388,7 @@ onMounted(() => {
   color: white;
 }
 
-.employee-list {
+.employees-container {
   margin-bottom: 16px;
 }
 
@@ -348,78 +407,79 @@ onMounted(() => {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
 }
 
+.employee-icon {
+  width: 60px;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #f0f9ff;
+  color: #409EFF;
+  border-radius: 12px;
+  margin-right: 16px;
+}
+
+.employee-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
 .employee-header {
-  padding: 12px 16px;
-  border-bottom: 1px solid #f0f0f0;
-}
-
-.radio-select {
-  font-size: 16px;
-  font-weight: bold;
-}
-
-.employee-content {
-  padding: 12px 16px;
-}
-
-.employee-description {
-  font-size: 14px;
-  color: #606266;
-  margin-bottom: 10px;
-  line-height: 1.5;
-}
-
-.employee-stats {
   display: flex;
   align-items: center;
+  margin-bottom: 4px;
 }
 
-.stat-item {
-  display: flex;
-  align-items: center;
-  margin-right: 20px;
+.employee-name {
+  margin: 0;
+  margin-right: 8px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.employee-category {
   color: #909399;
+  margin: 4px 0;
+  font-size: 14px;
 }
 
-.stat-item .el-icon {
-  margin-right: 4px;
+.employee-desc {
+  margin: 4px 0 12px;
+  color: #606266;
+  font-size: 14px;
 }
 
 .employee-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 16px;
-  border-top: 1px solid #f0f0f0;
+  margin-top: auto;
 }
 
-.employee-icon {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background-color: #f5f7fa;
+.employee-stats {
   display: flex;
   align-items: center;
-  justify-content: center;
-  font-size: 20px;
-  color: #409eff;
+  gap: 16px;
 }
 
-.ai-icon {
-  background-color: #e6f7ff;
-  color: #1890ff;
-  font-weight: bold;
-  font-size: 16px;
+.usage-count {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #909399;
+  font-size: 14px;
 }
 
-.doc-icon {
-  background-color: #f6ffed;
-  color: #52c41a;
+.employee-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.translator-icon {
-  background-color: #fff2e8;
-  color: #fa541c;
+.rating {
+  display: flex;
+  align-items: center;
 }
 
 .try-button {
